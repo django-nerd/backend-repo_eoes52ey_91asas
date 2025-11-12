@@ -1,19 +1,15 @@
 import os
-import shutil
-import uuid
-from typing import Optional, List
+import secrets
+from typing import Optional, List, Any
+from datetime import datetime, timezone
+
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.responses import FileResponse
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse, FileResponse
 
 from database import db, create_document, get_documents
-from schemas import Song as SongSchema
 
-UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-app = FastAPI(title="Song Distribution Platform")
+app = FastAPI(title="SongShare API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -23,14 +19,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
 
 @app.get("/")
 def read_root():
-    return {"message": "Song Distribution Platform API"}
+    return {"message": "SongShare backend running"}
+
+
+@app.get("/api/hello")
+def hello():
+    return {"message": "Hello from the backend API!"}
 
 
 @app.get("/test")
 def test_database():
+    """Test endpoint to check if database is available and accessible"""
     response = {
         "backend": "✅ Running",
         "database": "❌ Not Available",
@@ -39,206 +44,182 @@ def test_database():
         "connection_status": "Not Connected",
         "collections": []
     }
+
     try:
         if db is not None:
             response["database"] = "✅ Available"
-            response["database_url"] = "✅ Set"
-            response["database_name"] = getattr(db, "name", "✅ Connected")
+            response["database_url"] = "✅ Configured"
+            response["database_name"] = db.name if hasattr(db, 'name') else "✅ Connected"
             response["connection_status"] = "Connected"
             try:
                 collections = db.list_collection_names()
                 response["collections"] = collections[:10]
                 response["database"] = "✅ Connected & Working"
             except Exception as e:
-                response["database"] = f"⚠️ Connected but Error: {str(e)[:50]}"
+                response["database"] = f"⚠️  Connected but Error: {str(e)[:50]}"
         else:
-            response["database"] = "⚠️ Available but not initialized"
+            response["database"] = "⚠️  Available but not initialized"
+
     except Exception as e:
         response["database"] = f"❌ Error: {str(e)[:50]}"
 
-    response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
-    response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
+    import os as _os
+    response["database_url"] = "✅ Set" if _os.getenv("DATABASE_URL") else "❌ Not Set"
+    response["database_name"] = "✅ Set" if _os.getenv("DATABASE_NAME") else "❌ Not Set"
+
     return response
 
 
-# Helpers
+# ---------------------- Song Upload & Sharing ----------------------
 
-def make_slug(title: str, artist: str) -> str:
-    base = f"{title}-{artist}".strip().lower()
-    allowed = [c if c.isalnum() else '-' for c in base]
-    base_slug = '-'.join('-'.join(''.join(allowed).split()).split('-'))
-    base_slug = base_slug.strip('-') or 'song'
-    unique = uuid.uuid4().hex[:6]
-    slug = f"{base_slug}-{unique}"
-    # ensure uniqueness
-    while db["song"].find_one({"slug": slug}):
-        unique = uuid.uuid4().hex[:6]
-        slug = f"{base_slug}-{unique}"
-    return slug
-
-
-def record_event(slug: str, event_type: str, request: Request):
-    try:
-        # Increment counters on song document
-        if event_type == "view":
-            db["song"].update_one({"slug": slug}, {"$inc": {"views": 1}})
-        elif event_type == "download":
-            db["song"].update_one({"slug": slug}, {"$inc": {"downloads": 1}})
-        # Optionally store a separate event document
-        event_doc = {
-            "song_slug": slug,
-            "event_type": event_type,
-            "user_agent": request.headers.get("user-agent"),
-            "ip": request.client.host if request.client else None,
-        }
-        db["event"].insert_one(event_doc)
-    except Exception:
-        # Don't block primary action if analytics fails
-        pass
-
-
-class SongOut(BaseModel):
-    title: str
-    artist: str
-    description: Optional[str]
-    slug: str
-    filename: str
-    size: int
-    downloads: int
-    views: int
-    download_url: str
-
-
-@app.post("/api/songs", response_model=SongOut)
+@app.post("/api/songs/upload")
 async def upload_song(
-    request: Request,
     file: UploadFile = File(...),
     title: str = Form(...),
     artist: str = Form(...),
     description: Optional[str] = Form(None),
 ):
-    if file.content_type is None or not file.content_type.startswith("audio"):
-        raise HTTPException(status_code=400, detail="Please upload a valid audio file")
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
 
-    # Persist file to disk
-    original_name = file.filename or "audiofile"
-    ext = os.path.splitext(original_name)[1]
-    storage_name = f"{uuid.uuid4().hex}{ext}"
-    storage_path = os.path.join(UPLOAD_DIR, storage_name)
+    # Validate file type (basic check)
+    allowed = {"audio/mpeg", "audio/wav", "audio/x-wav", "audio/flac", "audio/aac", "audio/ogg", "audio/mp4", "audio/x-m4a"}
+    if file.content_type not in allowed:
+        # Allow unknown audio as fallback if extension looks like audio
+        allowed_exts = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a", ".mp4"}
+        _, ext = os.path.splitext(file.filename)
+        if ext.lower() not in allowed_exts:
+            raise HTTPException(status_code=400, detail="Unsupported audio format")
 
-    with open(storage_path, "wb") as out_file:
-        shutil.copyfileobj(file.file, out_file)
+    token = secrets.token_urlsafe(10)
+    _, ext = os.path.splitext(file.filename)
+    safe_ext = ext if ext else ""
+    stored_filename = f"{token}{safe_ext}"
+    file_path = os.path.join(UPLOAD_DIR, stored_filename)
 
-    slug = make_slug(title, artist)
+    size = 0
+    with open(file_path, "wb") as out:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            out.write(chunk)
 
-    song_doc = SongSchema(
-        title=title,
-        artist=artist,
-        description=description,
-        slug=slug,
-        filename=original_name,
-        storage_path=storage_path,
-        content_type=file.content_type,
-        size=os.path.getsize(storage_path),
-        downloads=0,
-        views=0,
-    )
+    doc = {
+        "title": title,
+        "artist": artist,
+        "description": description,
+        "token": token,
+        "file_path": file_path,
+        "original_filename": file.filename,
+        "mime_type": file.content_type,
+        "size_bytes": size,
+        "download_count": 0,
+    }
 
-    create_document("song", song_doc)
+    song_id = create_document("song", doc)
 
-    base_url = os.getenv("FRONTEND_URL") or os.getenv("BACKEND_URL") or ""
-    download_url = f"/api/songs/{slug}/download"
+    backend_url = os.getenv("BACKEND_URL") or ""
+    download_url = f"{backend_url}/api/songs/{token}/download" if backend_url else f"/api/songs/{token}/download"
+    meta_url = f"{backend_url}/api/songs/{token}" if backend_url else f"/api/songs/{token}"
 
-    return SongOut(
-        title=song_doc.title,
-        artist=song_doc.artist,
-        description=song_doc.description,
-        slug=song_doc.slug,
-        filename=song_doc.filename,
-        size=song_doc.size,
-        downloads=song_doc.downloads,
-        views=song_doc.views,
-        download_url=download_url,
-    )
-
-
-@app.get("/api/songs", response_model=List[SongOut])
-def list_songs(request: Request, limit: int = 20):
-    docs = db["song"].find().sort("created_at", -1).limit(limit)
-    items: List[SongOut] = []
-    for d in docs:
-        items.append(
-            SongOut(
-                title=d.get("title"),
-                artist=d.get("artist"),
-                description=d.get("description"),
-                slug=d.get("slug"),
-                filename=d.get("filename"),
-                size=d.get("size", 0),
-                downloads=d.get("downloads", 0),
-                views=d.get("views", 0),
-                download_url=f"/api/songs/{d.get('slug')}/download",
-            )
-        )
-    return items
+    return {
+        "id": song_id,
+        "token": token,
+        "download_url": download_url,
+        "meta_url": meta_url,
+    }
 
 
-@app.get("/api/songs/{slug}", response_model=SongOut)
-def get_song(slug: str, request: Request):
-    doc = db["song"].find_one({"slug": slug})
+@app.get("/api/songs/{token}")
+async def get_song(token: str):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    doc = db["song"].find_one({"token": token}, {"_id": 0})
     if not doc:
         raise HTTPException(status_code=404, detail="Song not found")
-    # Count a view
-    record_event(slug, "view", request)
-    return SongOut(
-        title=doc.get("title"),
-        artist=doc.get("artist"),
-        description=doc.get("description"),
-        slug=doc.get("slug"),
-        filename=doc.get("filename"),
-        size=doc.get("size", 0),
-        downloads=doc.get("downloads", 0),
-        views=doc.get("views", 0),
-        download_url=f"/api/songs/{doc.get('slug')}/download",
-    )
+
+    # Build a safe response without exposing file_path
+    backend_url = os.getenv("BACKEND_URL") or ""
+    download_url = f"{backend_url}/api/songs/{token}/download" if backend_url else f"/api/songs/{token}/download"
+
+    return {
+        "title": doc.get("title"),
+        "artist": doc.get("artist"),
+        "description": doc.get("description"),
+        "token": doc.get("token"),
+        "size_bytes": doc.get("size_bytes"),
+        "mime_type": doc.get("mime_type"),
+        "download_count": doc.get("download_count", 0),
+        "download_url": download_url,
+        "original_filename": doc.get("original_filename"),
+    }
 
 
-@app.get("/api/songs/{slug}/download")
-def download_song(slug: str, request: Request):
-    doc = db["song"].find_one({"slug": slug})
+@app.get("/api/songs/{token}/download")
+async def download_song(token: str, request: Request):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    doc = db["song"].find_one({"token": token})
     if not doc:
         raise HTTPException(status_code=404, detail="Song not found")
-    storage_path = doc.get("storage_path")
-    if not storage_path or not os.path.exists(storage_path):
-        raise HTTPException(status_code=404, detail="File not found on server")
 
-    # Record analytics
-    record_event(slug, "download", request)
+    file_path = doc.get("file_path")
+    if not file_path or not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File missing on server")
 
-    return FileResponse(
-        storage_path,
-        media_type=doc.get("content_type", "application/octet-stream"),
-        filename=doc.get("filename", f"{slug}.audio"),
-    )
+    # Increment download count and log analytics
+    db["song"].update_one({"_id": doc["_id"]}, {"$inc": {"download_count": 1}, "$set": {"updated_at": datetime.now(timezone.utc)}})
+
+    # Record analytics event
+    try:
+        analytics_doc = {
+            "token": token,
+            "song_title": doc.get("title"),
+            "event": "download",
+            "ip": request.client.host if request.client else None,
+            "user_agent": request.headers.get("user-agent"),
+            "referer": request.headers.get("referer"),
+            "timestamp": datetime.now(timezone.utc),
+        }
+        db["analytics"].insert_one(analytics_doc)
+    except Exception:
+        pass
+
+    filename = doc.get("original_filename") or os.path.basename(file_path)
+    return FileResponse(path=file_path, media_type=doc.get("mime_type") or "application/octet-stream", filename=filename)
 
 
-class AnalyticsOut(BaseModel):
-    total_songs: int
-    total_downloads: int
-    total_views: int
+# ---------------------- Analytics ----------------------
 
+@app.get("/api/analytics/overview")
+async def analytics_overview(limit: int = 10):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
 
-@app.get("/api/analytics", response_model=AnalyticsOut)
-def analytics():
-    docs = get_documents("song")
-    total_songs = len(docs)
-    total_downloads = sum(int(d.get("downloads", 0)) for d in docs)
-    total_views = sum(int(d.get("views", 0)) for d in docs)
-    return AnalyticsOut(
-        total_songs=total_songs,
-        total_downloads=total_downloads,
-        total_views=total_views,
-    )
+    total_songs = db["song"].count_documents({})
+    total_downloads = db["song"].aggregate([
+        {"$group": {"_id": None, "count": {"$sum": "$download_count"}}}
+    ])
+    total_downloads_val = 0
+    for row in total_downloads:
+        total_downloads_val = row.get("count", 0)
+
+    top_songs_cursor = db["song"].find({}, {"_id": 0, "title": 1, "artist": 1, "download_count": 1}).sort("download_count", -1).limit(limit)
+    top_songs = list(top_songs_cursor)
+
+    recent_downloads_cursor = db["analytics"].find({"event": "download"}, {"_id": 0}).sort("timestamp", -1).limit(limit)
+    recent_downloads = list(recent_downloads_cursor)
+
+    return {
+        "total_songs": total_songs,
+        "total_downloads": total_downloads_val,
+        "top_songs": top_songs,
+        "recent_downloads": recent_downloads,
+    }
 
 
 if __name__ == "__main__":
